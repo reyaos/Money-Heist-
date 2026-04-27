@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
-<title>MONEY HEIST v10 - XAU/USD · BTC/USD</title>
+<title>MONEY HEIST v10 · XAU/USD HFT</title>
 
 <!-- PWA Meta Tags -->
 <meta name="application-name" content="Money Heist v10"/>
@@ -12,7 +12,7 @@
 <meta name="apple-mobile-web-app-title" content="Money Heist"/>
 <meta name="mobile-web-app-capable" content="yes"/>
 <meta name="theme-color" content="#060608"/>
-<meta name="description" content="XAU/USD · BTC/USD · 16 PA Strategies · Ultra-God Mode"/>
+<meta name="description" content="XAU/USD · 16 PA Strategies · HFT Engine"/>
 
 <!-- PWA Manifest (inline as data URI so no extra file needed) -->
 <link rel="manifest" href="data:application/manifest+json,%7B%22name%22%3A%22Money%20Heist%20v10%22%2C%22short_name%22%3A%22MoneyHeist%22%2C%22description%22%3A%22XAU%2FUSD%20%C2%B7%20BTC%2FUSD%20Trading%20Bot%22%2C%22start_url%22%3A%22.%2F%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%23060608%22%2C%22theme_color%22%3A%22%23060608%22%2C%22orientation%22%3A%22portrait%22%2C%22icons%22%3A%5B%7B%22src%22%3A%22data%3Aimage%2Fpng%3Bbase64%2CiVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAABmJLR0QA%2FwD%2FAP%2BgvaeTAAAA8klEQVR4nO3BMQEAAADCoPVP7WsIoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAeAMBuAABHgAAAABJRU5ErkJggg%3D%3D%22%2C%22sizes%22%3A%22128x128%22%2C%22type%22%3A%22image%2Fpng%22%7D%5D%7D"/>
@@ -130,9 +130,11 @@ loadScript([
   .modal-bg{position:fixed;inset:0;background:#000000cc;z-index:100;display:flex;align-items:flex-end;justify-content:center}
   .modal-sheet{background:#0f0f12;border-radius:20px 20px 0 0;width:100%;max-width:520px;max-height:90vh;overflow-y:auto;animation:slideUp .25s ease;border-top:1px solid #1e1e22}
   .spinner{width:18px;height:18px;border:2px solid #333;border-top-color:#f5c830;border-radius:50%;animation:spin .7s linear infinite;display:inline-block;vertical-align:middle}
+  canvas{will-change:transform;transform:translateZ(0);}
+  *{-webkit-font-smoothing:antialiased;text-rendering:optimizeSpeed;}
 </style>
 <script type="text/babel-app">
-const{useState,useEffect,useRef,useCallback,useMemo}=React;
+const{useState,useEffect,useRef,useCallback,useMemo,startTransition}=React;
 
 // ── THEME ──────────────────────────────────────────────────────────
 const RED="#f03858",GREEN="#22c55e",GOLD="#f5c830",PURPLE="#a78bfa",
@@ -143,7 +145,7 @@ const RED="#f03858",GREEN="#22c55e",GOLD="#f5c830",PURPLE="#a78bfa",
 const SPREAD_OK=0.15,MAX_SPREAD=0.80,MIN_LOT=0.01,MAX_LOT=10.0,
       MAX_LOT_NORMAL=1.0,MAX_SCORE=16;
 // Per-instrument spread limits — BTC naturally has much wider spreads than XAU
-const SPREAD_LIMITS={XAUUSD:0.80,BTCUSD:8.0,V75:25.0,STEPIDX:5.0};
+const SPREAD_LIMITS={XAUUSD:0.80};
 
 // ── INSTRUMENT CONFIG ──────────────────────────────────────────────
 const INSTRUMENTS={
@@ -158,39 +160,8 @@ const INSTRUMENTS={
     spreadNorm:0.30,
     filterFn:p=>p>100&&p<15000,
   },
-  BTCUSD:{
-    label:"BTC/USD",icon:"₿",
-    derivSymbol:"cryBTCUSD",       // Deriv BTC symbol
-    derivTickSymbol:"cryBTCUSD",
-    yahooSymbol:"BTC-USD",
-    priceMin:1000, priceMax:500000,
-    pip:0.1,                        // $0.1 per pip per 0.01 lot (crypto pip = $1 move)
-    priceDp:2,
-    spreadNorm:50,
-    filterFn:p=>p>1000&&p<500000,
-  },
-  V75:{
-    label:"Vol 75",icon:"📈",
-    derivSymbol:"R_75",
-    derivTickSymbol:"R_75",
-    yahooSymbol:null,
-    priceMin:0, priceMax:99999999,
-    pip:1,
-    priceDp:2,
-    spreadNorm:1.0,
-    filterFn:p=>p>0,
-  },
-  STEPIDX:{
-    label:"Step Idx",icon:"📊",
-    derivSymbol:"stpRNG100",
-    derivTickSymbol:"stpRNG100",
-    yahooSymbol:null,
-    priceMin:0, priceMax:99999999,
-    pip:1,
-    priceDp:2,
-    spreadNorm:0.1,
-    filterFn:p=>p>0,
-  },
+
+
 };
 
 // ── SESSION / KILLZONE CONFIG ──────────────────────────────────────
@@ -566,24 +537,85 @@ async function fetchHistoricalData(tfMins, lookbackDays, _apiKeys, onProgress, i
 // ── LIVE PRICE FEEDS ───────────────────────────────────────────────
 
 // Deriv WebSocket — public, no key
+// Improvements vs original:
+//  1. Visibility reconnect — if tab was backgrounded, reconnects immediately on focus
+//  2. Stale-feed watchdog — if no tick arrives within 45s, force-reconnects
+//  3. Exponential backoff on reconnect (2s → 4s → 8s, max 15s)
+//  4. Clears ping interval before each new connect to avoid ghost intervals
 function createDerivFeed(onTick,onStatus,derivTickSymbol="frxXAUUSD"){
-  let ws=null,alive=true;
+  let ws=null,alive=true,pingIv=null,watchdogIv=null,lastTickTs=Date.now(),retryDelay=500;
+
+  function teardown(){
+    clearInterval(pingIv);pingIv=null;
+    clearInterval(watchdogIv);watchdogIv=null;
+    if(ws){try{ws.onopen=ws.onmessage=ws.onerror=ws.onclose=null;ws.close();}catch(_){}}
+    ws=null;
+  }
+
   function connect(){
+    if(!alive)return;
+    teardown();
     onStatus("Connecting to Deriv...");
-    ws=new WebSocket("wss://ws.binaryws.com/websockets/v3?app_id=1089");
+    try{ws=new WebSocket("wss://ws.binaryws.com/websockets/v3?app_id=1089");}
+    catch(e){onStatus("WS create failed, retrying...");scheduleReconnect();return;}
     ws.onopen=()=>{
+      if(!alive){ws.close();return;}
+      retryDelay=2000;// reset backoff on successful connect
       ws.send(JSON.stringify({ticks:derivTickSymbol,subscribe:1}));
       onStatus("● Deriv LIVE");
+      lastTickTs=Date.now();
+      // Heartbeat every 12s — keeps connection warm, Deriv closes at 60s idle
+      pingIv=setInterval(()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({ping:1}));},12000);
+      // Watchdog: if no tick for 45s, assume feed is dead and reconnect
+      watchdogIv=setInterval(()=>{
+        if(Date.now()-lastTickTs>20000){
+          onStatus("⚠ Feed stale — reconnecting...");
+          scheduleReconnect();
+        }
+      },10000);
     };
+    let _prevTickQ=0;
     ws.onmessage=e=>{
-      const d=JSON.parse(e.data);
-      if(d.tick&&d.tick.quote){onTick(+d.tick.quote,d.tick.ask,d.tick.bid,Date.now());}
+      try{
+        const d=JSON.parse(e.data);
+        if(d.tick&&d.tick.quote){
+          lastTickTs=Date.now();
+          const _q=+d.tick.quote;
+          if(_q===_prevTickQ)return; // skip zero-move ticks (Deriv re-sends same price)
+          _prevTickQ=_q;
+          onTick(_q,d.tick.ask,d.tick.bid,Date.now());
+        }
+      }catch(_){}
     };
-    ws.onerror=()=>onStatus("Deriv error");
-    ws.onclose=()=>{if(alive){setTimeout(connect,3000);onStatus("Deriv reconnecting...");}};
+    ws.onerror=()=>{if(alive)onStatus("Deriv error");};
+    ws.onclose=()=>{if(alive)scheduleReconnect();};
   }
+
+  function scheduleReconnect(){
+    teardown();
+    if(!alive)return;
+    onStatus("Deriv reconnecting...");
+    setTimeout(connect,retryDelay);
+    retryDelay=Math.min(retryDelay*2,8000); // exponential backoff, cap 8s
+  }
+
+  // Reconnect immediately when tab regains focus (browsers throttle timers in background)
+  function onVisible(){
+    if(document.visibilityState==="visible"&&alive){
+      const stale=Date.now()-lastTickTs>10000;
+      if(stale){onStatus("Tab resumed — reconnecting...");connect();}
+    }
+  }
+  document.addEventListener("visibilitychange",onVisible);
+
   connect();
-  return{close:()=>{alive=false;ws&&ws.readyState===1&&ws.close();}};
+  return{
+    close:()=>{
+      alive=false;
+      teardown();
+      document.removeEventListener("visibilitychange",onVisible);
+    }
+  };
 }
 
 // TwelveData live feed removed — Deriv WS handles live price
@@ -1056,21 +1088,28 @@ function checkExit(t, price){
   return null;
 }
 
-// News fetch
+// News fetch — retries once after 30s if result is empty (handles transient CDN failures)
 async function fetchNews(){
-  try{
-    const r=await fetchWithTimeout("https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",5000);
-    if(!r.ok)throw 0;const d=await r.json();
-    return d.filter(e=>(e.country==="USD"||(e.title||"").toLowerCase().includes("gold"))&&(e.impact==="High"||e.impact==="Medium"))
-      .map(e=>({title:e.title,date:e.date,impact:e.impact,forecast:e.forecast,actual:e.actual,
-        dir:e.actual&&e.forecast?(parseFloat(e.actual)>parseFloat(e.forecast)?"SELL":"BUY"):null}));
-  }catch{return[];}
+  async function attempt(){
+    try{
+      const r=await fetchWithTimeout("https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",5000);
+      if(!r.ok)throw 0;const d=await r.json();
+      return d.filter(e=>(e.country==="USD"||(e.title||"").toLowerCase().includes("gold"))&&(e.impact==="High"||e.impact==="Medium"))
+        .map(e=>({title:e.title,date:e.date,impact:e.impact,forecast:e.forecast,actual:e.actual,
+          dir:e.actual&&e.forecast?(parseFloat(e.actual)>parseFloat(e.forecast)?"SELL":"BUY"):null}));
+    }catch{return null;}
+  }
+  const first=await attempt();
+  if(first&&first.length>0)return first;
+  // Retry once after 30s — handles transient network/CDN failures at boot
+  await new Promise(r=>setTimeout(r,30000));
+  return(await attempt())||[];
 }
 
 // ── BACKTEST CONTROLS — collapsible panel (must be a real component to use useState) ──
 function BtControls({btRunning,setBtRunning,replayMode,setReplayMode,replaySpeed,setReplaySpeed,rReplaySpeed,btIdx,btCandles,replayStep}){
   const [ctrlOpen,setCtrlOpen]=useState(false);
-  const speedLabel=replaySpeed===500?"Normal":replaySpeed===50?"Fast":"V.Fast";
+  const speedLabel=replaySpeed===0?"⚡TURBO":replaySpeed===10?"🔥MAX":replaySpeed===50?"Fast":"Normal";
   return(
     <div style={{flexShrink:0}}>
       <div style={{display:"flex",gap:"6px",alignItems:"center",background:PANEL,
@@ -1113,9 +1152,10 @@ function BtControls({btRunning,setBtRunning,replayMode,setReplayMode,replaySpeed
             <div style={{display:"flex",gap:"6px",alignItems:"center"}}>
               <span style={{fontSize:"8px",color:DIM,marginRight:"2px",flexShrink:0}}>Speed:</span>
               {[
+                {label:"TURBO",ms:0,desc:"∞ candles/s"},
+                {label:"MAX",ms:10,desc:"~200/s"},
+                {label:"Fast",ms:50,desc:"~60/s"},
                 {label:"Normal",ms:500,desc:"Real pace"},
-                {label:"Fast",ms:50,desc:"10×"},
-                {label:"V.Fast",ms:10,desc:"50×"},
               ].map(({label,ms,desc})=>(
                 <button key={ms} onClick={()=>{setReplaySpeed(ms);rReplaySpeed.current=ms;}}
                   style={{flex:1,padding:"5px 4px",borderRadius:"6px",fontSize:"9px",fontWeight:"700",
@@ -1134,286 +1174,315 @@ function BtControls({btRunning,setBtRunning,replayMode,setReplayMode,replaySpeed
 }
 
 // ── CHART COMPONENT — Scrollable, clean candles, prev+current day ──
-function Chart({candles,trade,livePrice,height=320,replayIdx=null}){
-  const scrollRef=useRef(null);
-  const userScrolled=useRef(false);
-  const lastCandleCount=useRef(0);
+// ── roundRect polyfill (canvas helper) ──────────────────────────────
+function rrect(ctx,x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+  ctx.lineTo(x+w,y+h-r);ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+  ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+  ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);
+  ctx.closePath();
+}
 
-  // Candle display settings
-  const CANDLE_W=9;   // wider = more readable on mobile
-  const BODY_W=6;
-  const LABEL_W=56;
-  const PRICE_W=68;
+// ══════════════════════════════════════════════════════════════════
+//  CHART — Canvas + requestAnimationFrame (MT5-style real-time)
+//  Reads live data directly from rLiveCandles ref — zero React
+//  re-renders during live trading. Smooth 60fps updates via RAF.
+//  Falls back to `candles` prop for backtest / sim mode.
+// ══════════════════════════════════════════════════════════════════
+function Chart({candles,trade,livePrice,height=320,replayIdx=null,rLiveCandles=null}){
+  const containerRef=useRef(null);
+  const canvasRef=useRef(null);
+  const rafRef=useRef(null);
+  const scrollRef=useRef(0);      // candles scrolled from right edge (0=auto-right)
+  const autoScrollRef=useRef(true);
+  const touchXRef=useRef(0);
+  const draggingRef=useRef(false);
+  // Keep refs in sync with props (for RAF loop to read latest values)
+  const candlesRef=useRef(candles);
+  const tradeRef=useRef(trade);
+  const lpRef=useRef(livePrice);
+  useEffect(()=>{candlesRef.current=candles; canvasRef.current?.__markDirty?.();},[candles]);
+  useEffect(()=>{tradeRef.current=trade; canvasRef.current?.__markDirty?.();},[trade]);
+  useEffect(()=>{lpRef.current=livePrice; canvasRef.current?.__markDirty?.();},[livePrice]);
 
-  // Show all candles (prev+today) up to 400
-  const vis=candles.slice(-400);
+  const CW=9,BW=6,LW=56,RW=68; // candle width, body width, left axis, right axis
 
-  // Auto-scroll to right edge whenever new candles arrive, unless user scrolled away
   useEffect(()=>{
-    const el=scrollRef.current;
-    if(!el)return;
-    if(!userScrolled.current){
-      el.scrollLeft=el.scrollWidth;
+    const canvas=canvasRef.current;
+    const container=containerRef.current;
+    if(!canvas||!container)return;
+
+    // ── Resize canvas to match container (DPR-aware for crisp rendering) ──
+    let W=container.clientWidth, H=height;
+    let _rzTimer;
+    const resize=()=>{
+      const dpr=window.devicePixelRatio||1;
+      W=container.clientWidth;
+      canvas.width=W*dpr; canvas.height=H*dpr;
+      canvas.style.width=W+'px'; canvas.style.height=H+'px';
+      _dirty=true;
+    };
+    resize();
+    // Debounce resize — avoids cascade redraws on window drag
+    const ro=new ResizeObserver(()=>{clearTimeout(_rzTimer);_rzTimer=setTimeout(resize,40);}); ro.observe(container);
+
+    // ── Touch / wheel scroll ──
+    const onTS=e=>{draggingRef.current=true;autoScrollRef.current=false;touchXRef.current=e.touches[0].clientX;};
+    const onTM=e=>{
+      if(!draggingRef.current)return;
+      const dx=touchXRef.current-e.touches[0].clientX;
+      touchXRef.current=e.touches[0].clientX;
+      scrollRef.current=Math.max(0,scrollRef.current+dx/CW);
+    };
+    const onTE=()=>{draggingRef.current=false;if(scrollRef.current<0.5){autoScrollRef.current=true;scrollRef.current=0;}};
+    const onWh=e=>{
+      scrollRef.current=Math.max(0,scrollRef.current+e.deltaX/CW);
+      autoScrollRef.current=scrollRef.current<0.5;
+    };
+    canvas.addEventListener('touchstart',onTS,{passive:true});
+    canvas.addEventListener('touchmove',onTM,{passive:true});
+    canvas.addEventListener('touchend',onTE,{passive:true});
+    canvas.addEventListener('wheel',onWh,{passive:true});
+
+    // ── Colour constants ──
+    const GRN='#22c55e',RED='#ef4444',BDR='#1e293b',DM='#475569';
+    const GLD='#f59e0b',LIV='#38bdf8',BG='#0a0a0e';
+
+    // ══ MT5-SPEED RAF LOOP ════════════════════════════════════════
+    // ▸ Cached context (getContext per-frame = expensive GPU sync)
+    // ▸ desynchronized:true = compositor thread decoupled = zero stall
+    // ▸ alpha:false        = skip compositing alpha channel
+    // ▸ Dirty flag         = skip draw when nothing changed
+    // ▸ Live mode          = NEVER skip frames (tick arrives < 1s on XAUUSD)
+    // ▸ Backtest mode      = skip if dirty===false AND < 16ms since last draw
+    const _ctx2d = canvas.getContext('2d', {alpha:false, desynchronized:true});
+    let _lastDrawTs = 0, _dirty = true;
+    canvas.__markDirty = () => { _dirty = true; };
+
+    function draw(ts){
+      const isLive = rLiveCandles && rLiveCandles.current && rLiveCandles.current.length > 0;
+      if (!isLive && !_dirty && ts - _lastDrawTs < 16) {
+        rafRef.current = requestAnimationFrame(draw); return;
+      }
+      _dirty = false; _lastDrawTs = ts;
+      const dpr=window.devicePixelRatio||1;
+      W=container.clientWidth;
+      const ctx=_ctx2d;
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+
+      // Pick data source: live ref (live mode) or prop (backtest/sim)
+      const src=(rLiveCandles&&rLiveCandles.current&&rLiveCandles.current.length>0)
+        ?rLiveCandles.current : candlesRef.current;
+      const allVis=src.slice(-400);
+      const lp=lpRef.current||0;
+      const tr=tradeRef.current;
+
+      ctx.fillStyle=BG; ctx.fillRect(0,0,W,H);
+
+      if(allVis.length<1){
+        ctx.fillStyle=DM;ctx.font='11px monospace';
+        ctx.textAlign='center';
+        ctx.fillText('Waiting for candle data...',W/2,H/2);
+        rafRef.current=requestAnimationFrame(draw); return;
+      }
+
+      if(autoScrollRef.current) scrollRef.current=0;
+
+      const pad={t:12,b:24,l:LW,r:RW};
+      const chartW=W-pad.l-pad.r;
+      const visCount=Math.max(1,Math.floor(chartW/CW));
+      const scrolled=Math.floor(scrollRef.current);
+      const endIdx=Math.max(0,allVis.length-scrolled);
+      const startIdx=Math.max(0,endIdx-visCount);
+      const vis=allVis.slice(startIdx,endIdx);
+
+      // ── Price range ──
+      const pp=[];
+      vis.forEach(c=>{pp.push(c.high,c.low);});
+      if(lp>0)pp.push(lp);
+      if(tr){[tr.entry,tr.sl,tr.tp1,tr.tp2,tr.tp3].forEach(v=>{if(v!=null)pp.push(v);});}
+      if(!pp.length){rafRef.current=requestAnimationFrame(draw);return;}
+      const rawLo=Math.min(...pp),rawHi=Math.max(...pp);
+      const mgn=Math.max((rawHi-rawLo)*0.15,2);
+      const lo=rawLo-mgn,hi=rawHi+mgn,rng=hi-lo||1;
+      const py=p=>pad.t+((hi-p)/rng)*(H-pad.t-pad.b);
+      const pyC=p=>Math.max(pad.t+1,Math.min(H-pad.b-1,py(p)));
+      const px=i=>pad.l+(i+0.5)*CW;
+
+      // ── Grid ──
+      const rawStep=(hi-lo)/6;
+      const mag=Math.pow(10,Math.floor(Math.log10(rawStep)));
+      const step=Math.ceil(rawStep/mag)*mag||1;
+      ctx.font='7px "JetBrains Mono",monospace';
+      ctx.textAlign='right';
+      for(let p=Math.ceil(lo/step)*step;p<=hi;p=+(p+step).toFixed(2)){
+        const y=py(p);if(y<pad.t-2||y>H-pad.b+2)continue;
+        ctx.strokeStyle=BDR;ctx.lineWidth=0.5;ctx.globalAlpha=0.6;
+        ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();
+        ctx.globalAlpha=1;ctx.fillStyle=DM;ctx.fillText(p.toFixed(2),pad.l-4,y+2.5);
+      }
+
+      // ── Day boundaries ──
+      const dayBounds=[];
+      for(let i=1;i<vis.length;i++){
+        if(vis[i]?.ts&&vis[i-1]?.ts&&new Date(vis[i-1].ts).getUTCDate()!==new Date(vis[i].ts).getUTCDate())
+          dayBounds.push(i);
+      }
+      if(dayBounds.length>0){
+        const lb=dayBounds[dayBounds.length-1];
+        const x2=px(lb)-CW*0.5;
+        ctx.fillStyle='#ffffff08';ctx.fillRect(pad.l,pad.t,Math.max(0,x2-pad.l),H-pad.t-pad.b);
+        ctx.fillStyle='#60a5fa04';ctx.fillRect(x2,pad.t,Math.max(0,W-pad.r-x2),H-pad.t-pad.b);
+      }
+      ctx.setLineDash([4,4]);
+      dayBounds.forEach(i=>{
+        const x=px(i)-CW*0.5;
+        ctx.strokeStyle=GLD;ctx.lineWidth=1;ctx.globalAlpha=0.4;
+        ctx.beginPath();ctx.moveTo(x,pad.t);ctx.lineTo(x,H-pad.b);ctx.stroke();
+        ctx.globalAlpha=1;
+        if(vis[i]?.ts){
+          const lbl=new Date(vis[i].ts).toLocaleDateString('en-US',{month:'short',day:'numeric'});
+          ctx.font='7.5px "JetBrains Mono",monospace';ctx.textAlign='left';
+          ctx.fillStyle=GLD+'b0';ctx.fillText(lbl,x+3,pad.t+10);
+        }
+      });
+      ctx.setLineDash([]);
+
+      // ── Trade lines ──
+      const tLine=(price,col,lbl,dashed)=>{
+        if(price==null)return;
+        const yRaw=py(price),clamped=yRaw<pad.t+1||yRaw>H-pad.b-1;
+        const y=pyC(price),arr=clamped?(yRaw<pad.t+1?'▲':'▼'):'';
+        ctx.strokeStyle=col;ctx.lineWidth=clamped?0.8:1;
+        ctx.globalAlpha=clamped?0.35:0.90;
+        ctx.setLineDash(clamped?[2,4]:dashed?[4,3]:[]);
+        ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();
+        ctx.setLineDash([]);ctx.globalAlpha=1;
+        ctx.fillStyle=col;ctx.globalAlpha=clamped?0.50:0.88;
+        rrect(ctx,W-pad.r+1,y-7,RW-4,14,1);ctx.fill();ctx.globalAlpha=1;
+        ctx.fillStyle='#000';ctx.font='700 6px "JetBrains Mono",monospace';
+        ctx.textAlign='left';ctx.fillText(`${lbl}${arr} ${(+price).toFixed(2)}`,W-pad.r+3,y+2);
+      };
+      if(tr){
+        tLine(tr.tp3,'#A5D6A7',tr.p3Done?'TP3✓':'TP3',true);
+        tLine(tr.tp2,'#66BB6A',tr.p2Done?'TP2✓':'TP2',true);
+        tLine(tr.tp1,'#4CAF50',tr.p1Done?'TP1✓':'TP1',true);
+        tLine(tr.sl,tr.trailing?'#FFC107':'#FF3B30',tr.trailing?'TRAIL':'SL',false);
+        tLine(tr.entry,tr.dir==='BUY'?'#2196F3':'#F44336',tr.dir==='BUY'?'BUY':'SELL',false);
+      }
+
+      // ── Candles ──
+      vis.forEach((c,i)=>{
+        const x=px(i);
+        const bull=c.bull!==undefined?c.bull:c.close>=c.open;
+        const col=bull?GRN:RED,isLive=c.forming===true;
+        const yH=py(c.high),yL=py(c.low),yO=py(c.open),yC2=py(c.close);
+        const bTop=Math.min(yO,yC2),bH=Math.max(Math.abs(yO-yC2),1.5);
+        ctx.globalAlpha=isLive?0.65:0.95;
+        // Wick
+        ctx.strokeStyle=col;ctx.lineWidth=1.2;ctx.setLineDash([]);
+        ctx.beginPath();ctx.moveTo(x,yH);ctx.lineTo(x,yL);ctx.stroke();
+        // Body
+        ctx.fillStyle=isLive?col+'66':col;
+        ctx.fillRect(x-BW/2,bTop,BW,bH);
+        if(isLive){ctx.strokeStyle=col;ctx.lineWidth=0.8;ctx.strokeRect(x-BW/2,bTop,BW,bH);}
+        // Live forming bar indicator
+        if(isLive){
+          ctx.globalAlpha=0.25;ctx.strokeStyle=col;ctx.lineWidth=0.5;
+          ctx.setLineDash([2,6]);
+          ctx.beginPath();ctx.moveTo(x,pad.t);ctx.lineTo(x,H-pad.b);ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        ctx.globalAlpha=1;
+      });
+
+      // ── Current price tag ──
+      const last=vis[vis.length-1];
+      if(last){
+        const lastY=pyC(last.close),lastCol=last.bull?GRN:RED;
+        ctx.strokeStyle=lastCol;ctx.lineWidth=0.8;ctx.globalAlpha=0.55;
+        ctx.setLineDash([2,3]);
+        ctx.beginPath();ctx.moveTo(pad.l,lastY);ctx.lineTo(W-pad.r,lastY);ctx.stroke();
+        ctx.setLineDash([]);ctx.globalAlpha=1;
+        ctx.fillStyle=lastCol;rrect(ctx,W-pad.r+1,lastY-7,RW-3,14,1);ctx.fill();
+        ctx.fillStyle='#000';ctx.font='700 6.5px "JetBrains Mono",monospace';
+        ctx.textAlign='left';ctx.fillText(last.close.toFixed(2),W-pad.r+3,lastY+2);
+      }
+
+      // ── Live price tag (if different from last close) ──
+      if(lp>0&&last&&Math.abs(lp-last.close)>0.01){
+        const ly=pyC(lp);
+        ctx.strokeStyle=LIV;ctx.lineWidth=1;ctx.globalAlpha=0.85;
+        ctx.setLineDash([2,2]);
+        ctx.beginPath();ctx.moveTo(pad.l,ly);ctx.lineTo(W-pad.r,ly);ctx.stroke();
+        ctx.setLineDash([]);ctx.globalAlpha=1;
+        ctx.fillStyle=LIV;rrect(ctx,W-pad.r+1,ly-7,RW-3,14,1);ctx.fill();
+        ctx.fillStyle='#000';ctx.font='700 6.5px "JetBrains Mono",monospace';
+        ctx.textAlign='left';ctx.fillText(lp.toFixed(2),W-pad.r+3,ly+2);
+      }
+
+      // ── Right axis separator ──
+      ctx.strokeStyle=BDR;ctx.lineWidth=1;ctx.globalAlpha=0.5;
+      ctx.beginPath();ctx.moveTo(W-pad.r,pad.t);ctx.lineTo(W-pad.r,H-pad.b);ctx.stroke();
+      ctx.globalAlpha=1;
+
+      rafRef.current=requestAnimationFrame(draw);
     }
-    lastCandleCount.current=vis.length;
-  },[vis.length]);
 
-  // Reset userScrolled when user scrolls back to right edge
-  const onScroll=()=>{
-    const el=scrollRef.current;
-    if(!el)return;
-    const atRight=el.scrollWidth-el.scrollLeft-el.clientWidth<30;
-    if(atRight)userScrolled.current=false;
-    else userScrolled.current=true;
-  };
+    rafRef.current=requestAnimationFrame(draw);
+    return()=>{
+      cancelAnimationFrame(rafRef.current);ro.disconnect();
+      canvas.removeEventListener('touchstart',onTS);
+      canvas.removeEventListener('touchmove',onTM);
+      canvas.removeEventListener('touchend',onTE);
+      canvas.removeEventListener('wheel',onWh);
+    };
+  },[]); // empty deps — RAF reads from refs, never re-subscribes
 
-  if(vis.length<1)return(
-    <div style={{height,background:"#0a0a0e",borderRadius:"10px",border:`1px solid ${BORDER}`,
-      display:"flex",alignItems:"center",justifyContent:"center",color:DIM,fontSize:"11px"}}>
-      Waiting for candle data...
-    </div>
-  );
-
-  const totalW=Math.max(vis.length*CANDLE_W+LABEL_W+PRICE_W+20, 360);
-  const H=height;
-  const pad={t:12,b:24,l:LABEL_W,r:PRICE_W};
-
-  // ── Price scale: candles ONLY define the range ──
-  // Trade lines are clamped to the chart area — they never compress candles
-  const candleP=[];
-  vis.forEach(c=>{candleP.push(c.high);candleP.push(c.low);});
-  if(livePrice>0)candleP.push(livePrice);
-  const rawLo=Math.min(...candleP), rawHi=Math.max(...candleP);
-  const margin=Math.max((rawHi-rawLo)*0.15, 2); // 15% padding min 2pts — wicks never touch border
-  const lo=rawLo-margin, hi=rawHi+margin, rng=hi-lo||1;
-
-  const py=p=>pad.t+((hi-p)/rng)*(H-pad.t-pad.b);
-  const px=i=>pad.l+(i+0.5)*CANDLE_W;
-  // Clamp y so trade lines that fall outside the candle range pin to the edge instead of vanishing
-  const pyClamp=p=>{
-    const raw=py(p);
-    return Math.max(pad.t+1, Math.min(H-pad.b-1, raw));
-  };
-  const pyInRange=p=>{const y=py(p);return y>=pad.t-1&&y<=H-pad.b+1;};
-
-  // Day boundaries — where UTC date changes
-  const dayBounds=[];
-  for(let i=1;i<vis.length;i++){
-    if(vis[i].ts&&vis[i-1].ts){
-      if(new Date(vis[i-1].ts).getUTCDate()!==new Date(vis[i].ts).getUTCDate())
-        dayBounds.push(i);
-    }
-  }
-
-  // Price grid — 5-7 lines
-  const rawStep=(hi-lo)/6;
-  const magnitude=Math.pow(10,Math.floor(Math.log10(rawStep)));
-  const step=Math.ceil(rawStep/magnitude)*magnitude||1;
-  const gridLines=[];
-  for(let p=Math.ceil(lo/step)*step;p<=hi;p=+(p+step).toFixed(2)){
-    const y=py(p);
-    if(y>=pad.t-2&&y<=H-pad.b+2)gridLines.push({p,y});
-  }
-
-  const hLine=(p,col,lbl,solid=false,thick=0.8,glow=false)=>{
-    if(p==null)return null;
-    const y=py(p);
-    if(y<0||y>H)return null;
-    return(<g key={lbl+p}>
-      <line x1={pad.l} x2={totalW-pad.r} y1={y} y2={y} stroke={col} strokeWidth={thick}
-        strokeDasharray={solid?"none":"5,3"} opacity="0.70"/>
-      <rect x={totalW-pad.r+2} y={y-6} width={pad.r-4} height={12} fill={col+"18"} rx="2"
-        stroke={col} strokeWidth="0.5" opacity="0.8"/>
-      <text x={totalW-pad.r+4} y={y+1} fill={col} fontSize="6"
-        fontFamily="'JetBrains Mono',monospace" fontWeight="600" dominantBaseline="middle">{lbl} {(+p).toFixed(2)}</text>
-    </g>);
-  };
-
-  // MT5-style trade lines: solid coloured lines with price labels on right side
-  // MT5 colour scheme: Buy=blue entry, Sell=red entry, SL=red dashed, TP=green
-  const MT5_ENTRY_BUY="#2196F3";  // MT5 blue for buy entry
-  const MT5_ENTRY_SELL="#F44336"; // MT5 red for sell entry
-  const MT5_SL="#FF3B30";         // MT5 red for stop loss
-  const MT5_TP1="#4CAF50";        // MT5 green TP1
-  const MT5_TP2="#66BB6A";        // MT5 green TP2 (lighter)
-  const MT5_TP3="#A5D6A7";        // MT5 green TP3 (lightest)
-  const MT5_TRAIL="#FFC107";      // MT5 amber for trailing stop
-
-  const mt5Line=(p,col,lbl,price,dashed=false)=>{
-    if(p==null)return null;
-    const yRaw=py(p);
-    const clamped=yRaw<pad.t+1||yRaw>H-pad.b-1;
-    const y=pyClamp(p);
-    const lblW=52;
-    const arrow=clamped?(yRaw<pad.t+1?"▲":"▼"):"";
-    return(<g key={lbl+p}>
-      {/* MT5-style: 1px line, no glow, clean */}
-      <line x1={pad.l} x2={totalW-pad.r} y1={y} y2={y}
-        stroke={col} strokeWidth={clamped?0.8:1}
-        strokeDasharray={clamped?"2,4":dashed?"4,3":"none"}
-        opacity={clamped?0.35:0.90}/>
-      {/* Compact price tag — right side, small filled box */}
-      <rect x={totalW-pad.r+1} y={y-7} width={lblW-2} height={14}
-        fill={col} rx="1" opacity={clamped?0.50:0.88}/>
-      {/* Single-line label+price, compact */}
-      <text x={totalW-pad.r+3} y={y+1} fill="#000" fontSize="6"
-        fontFamily="'JetBrains Mono',monospace" fontWeight="700"
-        dominantBaseline="middle">{lbl}{arrow} {(+price).toFixed(2)}</text>
-    </g>);
-  };
-
-  const last=vis[vis.length-1];
-  const lastY=pyClamp(last.close);
-  const lastCol=last.bull?GREEN:RED;
+  // Header needs livePrice from state for the live indicator
+  const last=candles[candles.length-1];
+  const atr=calcATR(candles.length>1?candles:[]);
+  const vis0=candles[0];
+  const visN=candles[candles.length-1];
 
   return(
-    <div style={{borderRadius:"10px",border:`1px solid ${BORDER}`,overflow:"hidden",background:"#0a0a0e",
-      display:"flex",flexDirection:"column"}}>
-
+    <div style={{borderRadius:"10px",border:`1px solid ${BORDER}`,overflow:"hidden",background:"#0a0a0e",display:"flex",flexDirection:"column"}}>
       {/* Header */}
       <div style={{display:"flex",gap:"8px",padding:"5px 10px",borderBottom:`1px solid ${BORDER}22`,
         alignItems:"center",flexShrink:0,background:"#0c0c10"}}>
         <span style={{fontSize:"8px",color:GREEN,fontFamily:"'JetBrains Mono',monospace",fontWeight:"700"}}>● BULL</span>
         <span style={{fontSize:"8px",color:RED,fontFamily:"'JetBrains Mono',monospace",fontWeight:"700"}}>● BEAR</span>
-        {dayBounds.length>0&&<span style={{fontSize:"8px",color:GOLD+"aa",fontFamily:"'JetBrains Mono',monospace"}}>
-          | {dayBounds.length+1} day{dayBounds.length>0?"s":""} shown
-        </span>}
         {livePrice>0&&<span style={{fontSize:"8px",color:LIVE_COL,fontFamily:"'JetBrains Mono',monospace",
-          fontWeight:"700",animation:"blink 1.5s infinite"}}>📡 {livePrice.toFixed(2)}</span>}
+          fontWeight:"700",animation:"blink 0.8s infinite",letterSpacing:"-0.3px"}}>
+          ● LIVE {livePrice.toFixed(2)}</span>}
         <span style={{marginLeft:"auto",fontSize:"8px",color:DIM,fontFamily:"'JetBrains Mono',monospace"}}>
-          {vis.length} bars · ←scroll→
+          {candles.length} bars · ←drag→
         </span>
       </div>
-
-      {/* Scrollable SVG — the key: overflow on THIS div, not the parent */}
-      <div
-        ref={scrollRef}
-        onScroll={onScroll}
-        style={{
-          overflowX:"scroll",
-          overflowY:"hidden",
-          WebkitOverflowScrolling:"touch",
-          touchAction:"pan-x",         // critical for mobile horizontal scroll
-          cursor:"grab",
-          flexShrink:0,
-        }}>
-        <svg width={totalW} height={H} style={{display:"block"}}>
-          <rect width={totalW} height={H} fill="#0a0a0e"/>
-
-          {/* Prev day shading */}
-          {dayBounds.length>0&&(()=>{
-            const lb=dayBounds[dayBounds.length-1];
-            const x2=px(lb)-CANDLE_W*0.5;
-            return(<>
-              <rect x={pad.l} y={pad.t} width={Math.max(0,x2-pad.l)}
-                height={H-pad.t-pad.b} fill="#ffffff" opacity="0.02"/>
-              <rect x={x2} y={pad.t} width={Math.max(0,totalW-pad.r-x2)}
-                height={H-pad.t-pad.b} fill="#60a5fa" opacity="0.02"/>
-            </>);
-          })()}
-
-          {/* Grid lines */}
-          {gridLines.map(({p,y})=>(
-            <g key={p}>
-              <line x1={pad.l} x2={totalW-pad.r} y1={y} y2={y}
-                stroke={BORDER} strokeWidth="0.5" opacity="0.6"/>
-              <text x={pad.l-4} y={y} fill={DIM} fontSize="7"
-                fontFamily="'JetBrains Mono',monospace" textAnchor="end"
-                dominantBaseline="middle">{p.toFixed(2)}</text>
-            </g>
-          ))}
-
-          {/* Day boundary verticals */}
-          {dayBounds.map(i=>{
-            const x=px(i)-CANDLE_W*0.5;
-            const label=vis[i]?.ts?new Date(vis[i].ts).toLocaleDateString("en-US",{month:"short",day:"numeric"}):"";
-            return(<g key={i}>
-              <line x1={x} x2={x} y1={pad.t} y2={H-pad.b}
-                stroke={GOLD} strokeWidth="1" strokeDasharray="4,4" opacity="0.4"/>
-              <text x={x+3} y={pad.t+10} fill={GOLD} fontSize="7.5"
-                fontFamily="'JetBrains Mono',monospace" opacity="0.7">{label}</text>
-            </g>);
-          })}
-
-          {/* MT5-style trade level lines drawn on chart */}
-          {trade&&<>
-            {mt5Line(trade.tp3,MT5_TP3,trade.p3Done?"TP3✓":"TP3",trade.tp3,true)}
-            {mt5Line(trade.tp2,MT5_TP2,trade.p2Done?"TP2✓":"TP2",trade.tp2,true)}
-            {mt5Line(trade.tp1,MT5_TP1,trade.p1Done?"TP1✓":"TP1",trade.tp1,true)}
-            {mt5Line(trade.sl,trade.trailing?MT5_TRAIL:MT5_SL,trade.trailing?"TRAIL":"SL",trade.sl,false)}
-            {mt5Line(trade.entry,trade.dir==="BUY"?MT5_ENTRY_BUY:MT5_ENTRY_SELL,trade.dir==="BUY"?"BUY":"SELL",trade.entry,false)}
-          </>}
-
-          {/* ── CANDLES ── */}
-          {vis.map((c,i)=>{
-            const x=px(i);
-            const bull=c.bull!==undefined?c.bull:c.close>=c.open;
-            const col=bull?GREEN:RED;
-            const yH=py(c.high), yL=py(c.low);
-            const yO=py(c.open), yC=py(c.close);
-            const bodyTop=Math.min(yO,yC);
-            const bodyH=Math.max(Math.abs(yO-yC),1.5);
-            const isLive=c.forming===true;
-            const isLast=i===vis.length-1;
-            return(
-              <g key={c.ts||i}>
-                {/* Wick */}
-                <line x1={x} x2={x} y1={yH} y2={yL}
-                  stroke={col} strokeWidth="1.2" opacity={isLive?0.6:0.95}/>
-                {/* Body */}
-                <rect
-                  x={x-BODY_W/2} y={bodyTop}
-                  width={BODY_W} height={bodyH}
-                  fill={bull?(isLive?col+"66":col):(isLive?col+"88":col)}
-                  stroke={col} strokeWidth={isLive?"0.8":"0"}
-                  rx="0.5" opacity={isLive?0.7:0.95}/>
-                {/* Live forming candle marker */}
-                {isLive&&<line x1={x} x2={x} y1={pad.t} y2={H-pad.b}
-                  stroke={col} strokeWidth="0.5" strokeDasharray="2,6" opacity="0.3"/>}
-              </g>
-            );
-          })}
-
-          {/* Current price line — MT5 style: thin dashed, small tag */}
-          <line x1={pad.l} x2={totalW-pad.r} y1={lastY} y2={lastY}
-            stroke={lastCol} strokeWidth="0.8" strokeDasharray="2,3" opacity="0.55"/>
-          <rect x={totalW-pad.r+1} y={lastY-7} width={pad.r-3} height={14} fill={lastCol} rx="1"/>
-          <text x={totalW-pad.r+3} y={lastY+1} fill="#000" fontSize="6.5"
-            fontFamily="'JetBrains Mono',monospace" fontWeight="700"
-            dominantBaseline="middle">{last.close.toFixed(2)}</text>
-
-          {/* Live price line (if different from last candle) */}
-          {livePrice>0&&Math.abs(livePrice-last.close)>0.01&&(()=>{
-            const ly=pyClamp(livePrice);
-            return(<g>
-              <line x1={pad.l} x2={totalW-pad.r} y1={ly} y2={ly}
-                stroke={LIVE_COL} strokeWidth="1" strokeDasharray="2,2" opacity="0.85"/>
-              <rect x={totalW-pad.r+1} y={ly-7} width={pad.r-3} height={14} fill={LIVE_COL} rx="1"/>
-              <text x={totalW-pad.r+3} y={ly+1} fill="#000" fontSize="6.5"
-                fontFamily="'JetBrains Mono',monospace" fontWeight="700"
-                dominantBaseline="middle">{livePrice.toFixed(2)}</text>
-            </g>);
-          })()}
-
-        </svg>
+      {/* Canvas — full width, touch-scrollable */}
+      <div ref={containerRef} style={{width:"100%",flexShrink:0,touchAction:"none"}}>
+        <canvas ref={canvasRef} style={{display:"block",touchAction:"none"}}/>
       </div>
-
       {/* Footer */}
       <div style={{display:"flex",gap:"8px",padding:"3px 10px",borderTop:`1px solid ${BORDER}22`,
         flexWrap:"wrap",background:"#080809",flexShrink:0}}>
-        {vis[0]?.ts&&<span style={{fontSize:"8px",color:DIM,fontFamily:"'JetBrains Mono',monospace"}}>
-          {fmtDateShort(vis[0].ts)} → {fmtDateShort(vis[vis.length-1].ts)}
+        {vis0?.ts&&<span style={{fontSize:"8px",color:DIM,fontFamily:"'JetBrains Mono',monospace"}}>
+          {fmtDateShort(vis0.ts)} → {fmtDateShort(visN.ts)}
         </span>}
         <span style={{fontSize:"8px",color:DIM,fontFamily:"'JetBrains Mono',monospace",marginLeft:"auto"}}>
-          ATR {calcATR(vis).toFixed(2)}
+          ATR {atr.toFixed(2)}
         </span>
       </div>
     </div>
   );
 }
 
+// ── Memoize Chart to skip re-renders when parent state changes unrelated to chart ──
+const MemoChart=React.memo(Chart);
+
 // ── EQUITY CURVE ───────────────────────────────────────────────────
-function EquityCurve({hist,startBal}){
+const EquityCurve=React.memo(function EquityCurve({hist,startBal}){
   if(!hist||hist.length<2)return(
     <div style={{height:"60px",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"9px",color:DIM}}>Building equity curve…</div>
   );
@@ -1436,7 +1505,7 @@ function EquityCurve({hist,startBal}){
       </svg>
     </div>
   );
-}
+});
 
 function StrengthBar({pct}){
   const col=pct>=90?GOLD:pct>=70?GREEN:pct>=50?BLUE:MUTED;
@@ -1475,10 +1544,10 @@ function MTFBadge({bias}){
 }
 
 function SpreadPill({spread,inst}){
-  const limit=SPREAD_LIMITS[inst||"XAUUSD"]??MAX_SPREAD;
+  const limit=SPREAD_LIMITS["XAUUSD"]??MAX_SPREAD;
   const ok=spread<=limit*0.5;
-  const wide=spread>limit&&spread<=limit*3; // absorbed — yellow warning
-  const bad=spread>limit*3;                 // catastrophic — red hard block
+  const wide=spread>limit&&spread<=limit*3;
+  const bad=spread>limit*3;
   const col=bad?RED:wide?GOLD:GREEN;
   const lbl=bad?"BAD":wide?"WIDE":"SPD";
   return(
@@ -1614,15 +1683,15 @@ function App(){
   const INIT_BAL=50;
 
   // ── Mode: "backtest" | "forward" | "sim" ──────────────────────
-  const [mode,setMode]=useState("sim"); // sim=legacy sim, backtest=real candle replay, forward=live
-  const [instrument,setInstrument]=useState("XAUUSD"); // "XAUUSD" | "BTCUSD"
-  const rInstrument=useRef("XAUUSD");
+  const [mode,setMode]=useState("backtest"); // "backtest" | "forward" only
+  const instrument="XAUUSD"; // locked to XAU/USD only
+  const rInstrument=useRef("XAUUSD"); // always XAUUSD
   const [btStatus,setBtStatus]=useState("");
   const [btLoading,setBtLoading]=useState(false);
   const [btCandles,setBtCandles]=useState([]); // all loaded 1M candles
   const [btIdx,setBtIdx]=useState(0);          // current replay position
   const [btRunning,setBtRunning]=useState(false);
-  const [replaySpeed,setReplaySpeed]=useState(500);// ms per bar in auto-play — default Normal
+  const [replaySpeed,setReplaySpeed]=useState(10); // ms per bar — default MAX speed
   const [replayMode,setReplayMode]=useState("auto");// "auto"|"step"|"signal"
   // MTF candle stacks built from 1M data
   const [tfCandles,setTfCandles]=useState({m5:null,m15:null,h1:null,h4:null,d1:null});
@@ -1639,10 +1708,12 @@ function App(){
   // Live 1M candle builder from tick stream
   const rLiveM1=useRef({ts:null,open:null,high:null,low:null,close:null,vol:0});
   const rLiveCandles=useRef([]);
+  // Cached ATR — only recomputed on candle close, not every tick
+  const rCachedATR=useRef(2.0);
 
   // Instrument selector open/close state
-  const [fxOpen,setFxOpen]=useState(false);
-  const [synOpen,setSynOpen]=useState(false);
+  
+  
 
   // Core state
   const [running,setRunning]=useState(false);
@@ -1830,8 +1901,10 @@ function App(){
     const hour=candle.ts?new Date(candle.ts).getUTCHours()+(new Date(candle.ts).getUTCMinutes()/60):nowGMT();
     const spread=spreadOverride!=null?spreadOverride:rSpread.current;
     const atr=calcATR(newC);
+    rCachedATR.current=+atr.toFixed(2);// keep cache fresh for tick handler
     const currentATR=+atr.toFixed(2);
-    setLiveATR(currentATR);
+    // ATR display throttled — updates every 5 candles is plenty for the UI
+    if(!rTickN.current||rTickN.current%5===0) setLiveATR(currentATR);
 
     // Update Asian candles
     if(inAsian(hour))rAsianC.current=[...rAsianC.current,candle].slice(-200);
@@ -2123,24 +2196,30 @@ function App(){
       const atrNow=calcATR(newC);
       const atrFlatThresh=_currentInst==="BTCUSD"?50:0.5;
       if(atrNow<atrFlatThresh)reasons.push("ATR flat "+atrNow.toFixed(2));
-      const nb=masterSignal({cs:newC,hour,kL:rKLevels.current,spread:0,orb:rOrb.current,
-        news:rActiveNews.current,newsArr:rNews.current,fakeLog:rFakeLog.current,
-        minConf:1,tfCandles:rTfCandles.current,inst:rInstrument.current});
-      if(nb){
-        const got=Math.max(nb.buyVotes,nb.sellVotes);
+      // Reuse sig from above (already computed) — just check vote count for status
+      if(sig){
+        const got=Math.max(sig.buyVotes,sig.sellVotes);
         const need=rMinConf.current;
-        if(got>=need){reasons.push("✓"+got+"/16 votes ("+nb.dir+") strength:"+nb.strength+"%");}
-        else{reasons.push("need "+need+" confirms, got "+got+" ("+nb.dir+")");}
-      }else{reasons.push("no strategy votes · building pattern");}
+        if(got>=need){reasons.push("✓"+got+"/16 votes ("+sig.dir+") strength:"+sig.strength+"%");}
+        else{reasons.push("need "+need+" confirms, got "+got+" ("+sig.dir+")");}
+      }else{
+        // sig was null above — run with minConf:1 just for the status hint, cheap path
+        const nb=masterSignal({cs:newC,hour,kL:rKLevels.current,spread:0,orb:rOrb.current,
+          news:rActiveNews.current,newsArr:rNews.current,fakeLog:rFakeLog.current,
+          minConf:1,tfCandles:rTfCandles.current,inst:rInstrument.current});
+        if(nb){reasons.push("need "+rMinConf.current+" confirms, got "+Math.max(nb.buyVotes,nb.sellVotes)+" ("+nb.dir+")");}
+        else{reasons.push("no strategy votes · building pattern");}
+      }
       const mStateLbl=rMktState.current==="TRENDING"?"📈TREND":rMktState.current==="RANGING"?"📊RANGE":"⚡LIVE";
       setStatus("⏳ Scanning"+
         (inKZ?" · "+inKZ.n:"")+" · "+h2+"h GMT · "+mStateLbl+
         (reasons.length?" · "+reasons[0]:""));
     }
-    // ── CHART UPDATE: push candles to chart in backtest/sim mode ──
-    // In live/forward mode, the onTick handler manages setCandles with the forming bar.
+    // ── CHART UPDATE: throttled for MT5-like backtest speed ──
+    // In live/forward: chart reads rLiveCandles ref directly via RAF (zero overhead).
+    // In backtest: only push to React every 10 candles — chart still draws via RAF.
     if(rMode.current!=="forward"){
-      setCandles([...newC]);
+      if(rTickN.current%10===0||rTrade.current)setCandles([...newC]);
     }
   }
 
@@ -2230,46 +2309,74 @@ function App(){
     const newIdx=idx+1;
     rBtIdx.current=newIdx;setBtIdx(newIdx);
 
-    // ── CHART: push visible window of candles to chart on every step ──
-    // processCandle already calls setCandles([...newC]) for backtest mode,
-    // but we also throttle here at ultra-high speed to keep UI responsive.
-    // At slow speeds (<= 50ms), every step redraws. At fast speeds, redraw every 5 candles.
-    const throttle=rReplaySpeed.current<=50?1:5;
+    // ── CHART THROTTLE — adaptive based on speed ──
+    // TURBO (0ms): every 50 candles — keeps UI alive without choking
+    // MAX   (10): every 10 candles
+    // Fast  (50): every 2 candles
+    // Normal(500): every candle (real pace)
+    const spd=rReplaySpeed.current;
+    const throttle=spd===0?50:spd<=10?10:spd<=50?2:1;
     if(newIdx%throttle===0){
-      // Show last 200 candles leading up to current position
-      const visSlice=candles1M.slice(Math.max(0,newIdx-200),newIdx);
+      const visSlice=candles1M.slice(Math.max(0,newIdx-400),newIdx);
       setCandles([...visSlice]);
     }
 
     return newIdx<candles1M.length;
   },[]);
 
-  // Auto-play loop
+  // ── BACKTEST AUTO-PLAY LOOP ──────────────────────────────────
+  // Speed tiers (rReplaySpeed):
+  //   0   = TURBO   : 200 candles per rAF frame via MessageChannel micro-task
+  //   10  = MAX     : 1 candle per MessageChannel tick (~100-200/sec)
+  //   50  = Fast    : 1 candle per rAF frame (~60/sec)
+  //   500 = Normal  : 1 candle per setTimeout delay (real pace)
   useEffect(()=>{
     if(mode!=="backtest"||!btRunning||btCandles.length===0)return;
-    if(rReplayMode.current==="step")return;// step mode: manual only
+    if(rReplayMode.current==="step")return;
 
     let cancelled=false;
-    const loop=async()=>{
-      while(!cancelled&&rBtRunning.current&&rBtIdx.current<btCandles.length){
-        const hasMore=replayStep(btCandles);
-        if(!hasMore){
-          setBtRunning(false);
-          setStatus("✅ Backtest complete · "+btCandles.length.toLocaleString()+" candles replayed");
-          break;
+    const mc=typeof MessageChannel!=="undefined"?new MessageChannel():null;
+
+    const done=()=>{
+      setBtRunning(false);
+      setStatus("✅ Backtest complete · "+btCandles.length.toLocaleString()+" candles replayed");
+    };
+
+    const loop=()=>{
+      if(cancelled||!rBtRunning.current||rBtIdx.current>=btCandles.length)return;
+      const spd=rReplaySpeed.current;
+      const isSignalMode=rReplayMode.current==="signal";
+
+      if(spd===0&&!isSignalMode){
+        // TURBO: batch 200 candles per rAF frame
+        let n=0;
+        while(n++<200&&rBtRunning.current&&rBtIdx.current<btCandles.length){
+          if(!replayStep(btCandles)){done();return;}
         }
-        if(rReplayMode.current==="signal"){
-          // Jump to next signal — brief pause when in trade so chart updates, instant otherwise
-          if(rTrade.current)await new Promise(r=>setTimeout(r,80));
-          else await new Promise(r=>setTimeout(r,1));
-        }else{
-          // Auto speed — delay controls how many candles/sec
-          await new Promise(r=>setTimeout(r,rReplaySpeed.current));
-        }
+        requestAnimationFrame(loop);
+      }else if(spd<=10||isSignalMode){
+        // MAX / Signal: 1 candle per MessageChannel micro-task
+        if(!replayStep(btCandles)){done();return;}
+        if(isSignalMode&&rTrade.current){
+          // Trade open in signal mode — slow down so user can see it
+          setTimeout(loop,60);
+        }else if(mc){
+          mc.port1.onmessage=loop;
+          mc.port2.postMessage(null);
+        }else requestAnimationFrame(loop);
+      }else if(spd<=50){
+        // Fast: 1 candle per rAF frame (~60/sec)
+        if(!replayStep(btCandles)){done();return;}
+        requestAnimationFrame(loop);
+      }else{
+        // Normal: 1 candle per setTimeout (real pace)
+        if(!replayStep(btCandles)){done();return;}
+        setTimeout(loop,spd);
       }
     };
-    loop();
-    return()=>{cancelled=true;};
+
+    requestAnimationFrame(loop);
+    return()=>{cancelled=true;if(mc)mc.port1.onmessage=null;};
   },[btRunning,mode,btCandles,replayStep]);
 
   // ══════════════════════════════════════════════════════════════
@@ -2325,7 +2432,9 @@ function App(){
 
           // Seed rCandles so strategies have full context immediately
           rCandles.current=rLiveCandles.current.slice(-800);
-          setCandles([...rLiveCandles.current.slice(-400)]);// show full prev+today
+          // Pre-seed ATR cache so tick handler has a valid value from the start
+          rCachedATR.current=calcATR(rLiveCandles.current);
+          setCandles([...rLiveCandles.current.slice(-800)]);// show full prev+today
           const closedBars=rLiveCandles.current.filter(c=>!c.forming).length;
           setLiveStatus(`✓ ${closedBars} real 1M bars loaded (Deriv prev+today) · Live feed connecting...`);
           setStatus(`✓ ${closedBars} candles from Deriv · Scanning for signal...`);
@@ -2387,9 +2496,14 @@ function App(){
 
   const connectLiveFeed=useCallback(()=>{
     const onTick=(price,ask,bid,ts)=>{
-      rLivePrice.current=price;setLivePrice(price);setLastFetchTs(Date.now());
+      rLivePrice.current=price;
       const spread=ask&&bid?+(ask-bid).toFixed(2):0.30;
-      rSpread.current=spread;setLiveSpread(spread);
+      rSpread.current=spread;
+      // Throttle React state updates — chart reads from refs via RAF, UI only needs ~2/s
+      rTickN.current=(rTickN.current||0)+1;
+      // MT5-speed: chart reads rLiveCandles ref via RAF — React state only needed for UI numbers
+      // Throttle to every 3rd tick (~1/sec on XAU) — chart still runs at full 60fps via RAF
+      if(rTickN.current%3===0){setLivePrice(price);setLiveSpread(spread);setLastFetchTs(Date.now());}
 
       // ── Build 1M candles using updateLiveCandle (pure helper) ──
       // History candles (forming:false) are preserved; updateLiveCandle appends the live bar.
@@ -2411,17 +2525,24 @@ function App(){
       rLiveCandles.current=nextLive;
 
       if(candleClosed){
+        // Candle just closed — force chart to redraw immediately (MT5-like snap)
+        // canvasRef not accessible here, but the RAF loop reads rLiveCandles ref directly
+        // so the next frame will pick it up automatically. Just ensure _dirty is set.
         // The second-to-last entry is the newly closed live bar
         const closed=nextLive[nextLive.length-2];
+        // Build MTF once from closed candles only (filter once, reuse)
+        const closedOnly=nextLive.filter(c=>!c.forming);
         const tfc={
-          m5:aggregateCandles(nextLive.filter(c=>!c.forming),5).slice(-100),
-          m15:aggregateCandles(nextLive.filter(c=>!c.forming),15).slice(-100),
-          h1:aggregateCandles(nextLive.filter(c=>!c.forming),60).slice(-100),
-          h4:aggregateCandles(nextLive.filter(c=>!c.forming),240).slice(-200),
-          d1:aggregateCandles(nextLive.filter(c=>!c.forming),1440).slice(-500),
+          m5:aggregateCandles(closedOnly,5).slice(-100),
+          m15:aggregateCandles(closedOnly,15).slice(-100),
+          h1:aggregateCandles(closedOnly,60).slice(-100),
+          h4:aggregateCandles(closedOnly,240).slice(-200),
+          d1:aggregateCandles(closedOnly,1440).slice(-500),
         };
         rTfCandles.current=tfc;setTfCandles(tfc);
-        if(rCandles.current.length<10&&nextLive.length>10)rCandles.current=nextLive.filter(c=>!c.forming).slice(-400);
+        // Cache ATR so tick handler doesn't recompute it every tick
+        rCachedATR.current=calcATR(nextLive);
+        if(rCandles.current.length<10&&nextLive.length>10)rCandles.current=closedOnly.slice(-400);
         if(rRunning.current)processCandle(closed,spread);
         // Track live bar state for compatibility
         rLiveM1.current={ts:nextLast.ts,open:nextLast.open,high:nextLast.high,low:nextLast.low,close:price,vol:1};
@@ -2434,8 +2555,8 @@ function App(){
       // Previously the bot only checked exits when a 1M candle closed (once per minute),
       // so intra-candle trail breaches (e.g. SELL with price going above trail) were missed.
       if(rRunning.current&&rTrade.current){
-        const srcCandles=rLiveCandles.current.length>5?rLiveCandles.current:rCandles.current;
-        const atrNow=calcATR(srcCandles);
+        // Use cached ATR (updated on each candle close) — avoids recomputing on every tick
+        const atrNow=rCachedATR.current;
         rTrade.current=manageTrade(rTrade.current,price,atrNow,rLiveProvider.current,INSTRUMENTS[rInstrument.current]?.pip||10);
         const tickExit=checkExit(rTrade.current,price);
         if(tickExit&&!tickExit.partial){
@@ -2472,8 +2593,7 @@ function App(){
         }
       }
       if(rRunning.current&&rTrade2.current){
-        const srcCandles2=rLiveCandles.current.length>5?rLiveCandles.current:rCandles.current;
-        const atrNow2=calcATR(srcCandles2);
+        const atrNow2=rCachedATR.current;
         rTrade2.current=manageTrade(rTrade2.current,price,atrNow2,rLiveProvider.current,INSTRUMENTS[rInstrument.current]?.pip||10);
         const tick2Exit=checkExit(rTrade2.current,price);
         if(tick2Exit&&!tick2Exit.partial){
@@ -2497,11 +2617,9 @@ function App(){
         }
       }
 
-      // Always render: full prev+today history + the live forming bar.
-      // rLiveCandles = [...historicalClosed, formingBar]
-      // Show last 400 for good prev-day context on chart.
-      setCandles([...rLiveCandles.current.slice(-400)]);
-      setLiveLastFetch(new Date().toLocaleTimeString());
+      // MT5-speed: chart reads rLiveCandles ref via RAF — zero setCandles overhead here.
+      // Non-critical UI refresh wrapped in startTransition (yields to chart RAF first).
+      startTransition(()=>{ setLiveLastFetch(new Date().toLocaleTimeString()); });
     };
 
     const onStatus=s=>setLiveStatus(s);
@@ -2642,36 +2760,31 @@ function App(){
               <span style={{fontSize:"7px",color:PURPLE,marginLeft:"4px",padding:"1px 5px",background:PURPLE+"18",borderRadius:"3px",border:`1px solid ${PURPLE}30`}}>ULTRA-GOD</span>
             </div>
             <div style={{fontSize:"7.5px",color:DIM,letterSpacing:"0.1em"}}>
-              {INSTRUMENTS[instrument]?.icon} {INSTRUMENTS[instrument]?.label} · MTF 1M→1D · 16 PA STRATS · ULTRA-GOD · {mode==="backtest"?"BACKTEST":mode==="forward"?"LIVE":"SIM"}
+              🥇 XAU/USD · MTF 1M→1D · 16 PA STRATS · {mode==="forward"?"● LIVE":"⏪ BACKTEST"}
             </div>
           </div>
         </div>
         <div style={{flex:1}}/>
-        {/* ── ACTIVE INSTRUMENT BADGE — tap to go to Settings to change ── */}
-        <div onClick={()=>setTab("settings")}
-          style={{flexShrink:0,cursor:"pointer",padding:"3px 9px",borderRadius:"5px",
-            background:(instrument==="V75"||instrument==="STEPIDX")?PURPLE+"22":GOLD+"22",
-            border:`1px solid ${(instrument==="V75"||instrument==="STEPIDX")?PURPLE:GOLD}`,
-            color:(instrument==="V75"||instrument==="STEPIDX")?PURPLE:GOLD,
-            fontSize:"9px",fontWeight:"700",whiteSpace:"nowrap",userSelect:"none"}}>
-          {INSTRUMENTS[instrument]?.icon} {INSTRUMENTS[instrument]?.label} ▾
-        </div>
+        <div style={{flexShrink:0,padding:"3px 9px",borderRadius:"5px",background:GOLD+"22",border:`1px solid ${GOLD}`,color:GOLD,fontSize:"9px",fontWeight:"700",whiteSpace:"nowrap"}}>🥇 XAU/USD</div>
         <HeartbeatDot lastFetchTime={lastFetchTs}/>
         {price>0&&(
           <div style={{display:"flex",alignItems:"baseline",gap:"4px",fontFamily:"'JetBrains Mono',monospace",
             padding:"3px 9px",borderRadius:"6px",background:mode==="forward"?"#1a1400":"transparent",
             border:mode==="forward"?`1px solid ${GOLD}30`:"1px solid transparent",
             animation:mode==="forward"?"glowPulse 3s ease infinite":"none"}}>
-            <span style={{fontSize:"19px",fontWeight:"700",color:mode==="forward"?GOLD:TEXT}}>{price.toFixed(2)}</span>
+            <span style={{fontSize:mode==="forward"?"22px":"19px",fontWeight:"700",
+            color:mode==="forward"?GOLD:TEXT,
+            letterSpacing:mode==="forward"?"-0.5px":"normal",
+            transition:"font-size 0.2s"}}>{price.toFixed(2)}</span>
             <span style={{fontSize:"11px",color:priceUp?GREEN:RED}}>{priceUp?"▲":"▼"}</span>
           </div>
         )}
         {/* Mode badge */}
         <div style={{padding:"3px 9px",borderRadius:"20px",fontSize:"9px",fontWeight:"600",
-          background:mode==="forward"?RED+"20":mode==="backtest"?PURPLE+"20":"#1a1a2a",
-          border:`1px solid ${mode==="forward"?RED+"40":mode==="backtest"?PURPLE+"40":"#333"}`,
-          color:mode==="forward"?RED:mode==="backtest"?PURPLE:DIM}}>
-          {mode==="forward"?"● LIVE":mode==="backtest"?"⏪ BACKTEST":"🎮 SIM"}
+          background:mode==="forward"?RED+"20":PURPLE+"20",
+          border:`1px solid ${mode==="forward"?RED+"40":PURPLE+"40"}`,
+          color:mode==="forward"?RED:PURPLE}}>
+          {mode==="forward"?"● LIVE":"⏪ BACKTEST"}
         </div>
         {kz&&<div style={{padding:"3px 9px",borderRadius:"20px",fontSize:"9px",background:`${kz.c}15`,border:`1px solid ${kz.c}40`,color:kz.c}}>● {kz.n}</div>}
         {inBlackoutNow&&<div style={{padding:"3px 9px",borderRadius:"20px",fontSize:"9px",background:RED+"15",border:`1px solid ${RED}40`,color:RED,animation:"blink 1s infinite"}}>📰 HIGH NEWS 🚫</div>}
@@ -2830,7 +2943,7 @@ function App(){
 
           {/* Chart — fills all remaining space */}
           <div style={{flex:1,minHeight:0}}>
-            <Chart candles={candles} trade={trade} livePrice={mode==="forward"?livePrice:null} height={360} replayIdx={mode==="backtest"?btIdx:null}/>
+            <MemoChart candles={candles} trade={trade} livePrice={mode==="forward"?livePrice:null} height={360} replayIdx={mode==="backtest"?btIdx:null} rLiveCandles={mode==="forward"?rLiveCandles:null}/>
           </div>
         </div>
       ):(
@@ -2845,11 +2958,10 @@ function App(){
               <div style={{fontSize:"10px",color:DIM,marginBottom:"12px",textTransform:"uppercase"}}>Select Mode</div>
               <div style={{display:"flex",flexDirection:"column",gap:"8px"}}>
                 {[
-                  {id:"backtest",icon:"⏪",title:"Backtest",desc:`Replay real ${INSTRUMENTS[instrument]?.label||"XAU/USD"} 1M candles from history. Choose range below.`,col:PURPLE},
-                  {id:"forward",icon:"📡",title:"Forward Test (Live)",desc:`Fetches prev+today candles first, then connects to live ${INSTRUMENTS[instrument]?.label||"XAU/USD"}. Bot trades on real-time 1M candles.`,col:RED},
-                  {id:"sim",icon:"🎮",title:"Simulation",desc:"Fast sim mode with synthetic candles. Good for testing logic quickly.",col:BLUE},
+                  {id:"backtest",icon:"⏪",title:"Backtest",desc:`Replay real XAU/USD 1M candles from history. Choose range below.`,col:PURPLE},
+                  {id:"forward",icon:"📡",title:"Forward Test (Live)",desc:`Fetches prev+today candles first, then connects to live XAU/USD. Bot trades on real-time 1M candles.`,col:RED},
                 ].map(({id,icon,title,desc,col})=>(
-                  <button key={id} onClick={()=>{setMode(id);setStatus(id==="sim"?"Sim mode ready":"Choose settings below, then load data.");}}
+                  <button key={id} onClick={()=>{setMode(id);setStatus("Choose settings below, then load data.");}}
                     style={{background:mode===id?col+"15":"#0d0d0f",border:`1.5px solid ${mode===id?col:BORDER}`,
                       borderRadius:"8px",padding:"12px",cursor:"pointer",textAlign:"left"}}>
                     <div style={{display:"flex",gap:"10px",alignItems:"center"}}>
@@ -3206,7 +3318,7 @@ function App(){
               {(()=>{
                 const switchInst=(key)=>{
                   const cfg=INSTRUMENTS[key];
-                  setInstrument(key);rInstrument.current=key;_currentInst=key;
+                  // setInstrument(key);rInstrument.current=key;_currentInst=key;
                   setCandles([]);setLivePrice(0);
                   if(liveFeedRef.current){liveFeedRef.current.close();liveFeedRef.current=null;}
                   setLiveStatus("");setStatus("→ "+cfg.label+". Select mode and start.");
